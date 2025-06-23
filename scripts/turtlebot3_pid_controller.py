@@ -1,105 +1,90 @@
 #!/usr/bin/env python3
 
 import rospy
-import math
 import numpy as np
+import math
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 
-class PIDController:
+class DistanceMaintainer:
     def __init__(self):
-        rospy.init_node('pid_controller_node')
-        
-        self.target_distance = 1.0  
-        self.kp = 0.8            
-        self.ki = 0.0              
-        self.kd = 0.2              
-        self.max_speed = 0.5       
-        self.sector_degrees = 5.0
-        
-        self.prev_error = 0.0
-        self.integral = 0.0
-        self.last_time = rospy.Time.now()
-        self.prev_distance = None
-        
-        self.scan_sub = rospy.Subscriber('/scan_filtered', LaserScan, self.scan_callback)
-        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-        
-        rospy.loginfo("PID Controller node started")
-        rospy.loginfo(f"Target distance: {self.target_distance} m")
-        rospy.loginfo(f"Front sector: {self.sector_degrees}°")
-        rospy.loginfo(f"PID parameters: Kp={self.kp}, Ki={self.ki}, Kd={self.kd}")
-        rospy.loginfo(f"Max speed: {self.max_speed} m/s")
-    
-    def get_front_distance(self, scan):
-        sector_rad = math.radians(self.sector_degrees) / 2.0
-        
-        num_readings = len(scan.ranges)
-        
-        sector_distances = []
-        for i in range(num_readings):
-            angle = scan.angle_min + i * scan.angle_increment
-            
-            if angle > math.pi:
-                angle -= 2 * math.pi
-            elif angle < -math.pi:
-                angle += 2 * math.pi
-            
-            if -sector_rad <= angle <= sector_rad:
-                distance = scan.ranges[i]
-                
-                if not (np.isnan(distance) or np.isinf(distance)) and scan.range_min <= distance <= scan.range_max:
-                    sector_distances.append(distance)
-        
-        if not sector_distances:
-            return None
+        rospy.init_node("distance_regulator")
 
-        return min(sector_distances)
-    
-    def scan_callback(self, scan):
-        distance = self.get_front_distance(scan)
-        
-        if distance is None:
-            cmd_vel = Twist()
-            self.cmd_vel_pub.publish(cmd_vel)
+        # Параметры регулятора
+        self.desired_range = 1.2
+        self.gain_p = 0.8
+        self.gain_i = 0.0
+        self.gain_d = 0.2
+        self.velocity_limit = 0.6
+        self.view_angle_deg = 5.0
+
+        # Внутреннее состояние
+        self.accumulated_error = 0.0
+        self.last_range = None
+        self.previous_time = rospy.Time.now()
+
+        # Подписка и публикация
+        self.lidar_sub = rospy.Subscriber("/scan_filtered", LaserScan, self.process_scan)
+        self.velocity_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+
+        rospy.loginfo("Регулятор расстояния инициализирован")
+        rospy.loginfo(f"Цель: {self.desired_range} м, Угол обзора: ±{self.view_angle_deg}°")
+        rospy.loginfo(f"Параметры PID: P={self.gain_p}, I={self.gain_i}, D={self.gain_d}")
+        rospy.loginfo(f"Макс. скорость: {self.velocity_limit} м/с")
+
+    def extract_central_range(self, scan_msg):
+        angle_halfwidth = math.radians(self.view_angle_deg) / 2
+        valid_ranges = []
+
+        for idx, reading in enumerate(scan_msg.ranges):
+            angle = scan_msg.angle_min + idx * scan_msg.angle_increment
+
+            if -angle_halfwidth <= angle <= angle_halfwidth:
+                if scan_msg.range_min <= reading <= scan_msg.range_max:
+                    if not np.isnan(reading) and not np.isinf(reading):
+                        valid_ranges.append(reading)
+
+        return min(valid_ranges) if valid_ranges else None
+
+    def process_scan(self, scan_data):
+        current_range = self.extract_central_range(scan_data)
+        if current_range is None:
+            self.velocity_pub.publish(Twist())  # остановка
             return
 
-        current_time = rospy.Time.now()
-        dt = (current_time - self.last_time).to_sec()
-        if dt <= 0:
+        now = rospy.Time.now()
+        delta_t = (now - self.previous_time).to_sec()
+        if delta_t <= 0:
             return
 
-        error = distance - self.target_distance
+        # Расчёт ошибки и PID составляющих
+        deviation = current_range - self.desired_range
 
-        P = self.kp * error
+        prop = self.gain_p * deviation
+        self.accumulated_error += deviation * delta_t
+        integral = self.gain_i * self.accumulated_error
 
-        self.integral += error * dt
-        I = self.ki * self.integral
-
-        if self.prev_distance is not None:
-            derivative = (distance - self.prev_distance) / dt
+        if self.last_range is not None:
+            rate = (current_range - self.last_range) / delta_t
         else:
-            derivative = 0.0
-        D = self.kd * derivative
+            rate = 0.0
+        derivative = self.gain_d * rate
 
-        control_signal = P + I + D
+        # Командный сигнал
+        output_speed = prop + integral + derivative
+        output_speed = max(min(output_speed, self.velocity_limit), -self.velocity_limit)
 
-        if control_signal > self.max_speed:
-            control_signal = self.max_speed
-        elif control_signal < -self.max_speed:
-            control_signal = -self.max_speed
+        # Публикация команды
+        motion_cmd = Twist()
+        motion_cmd.linear.x = output_speed
+        self.velocity_pub.publish(motion_cmd)
 
-        cmd_vel = Twist()
-        cmd_vel.linear.x = control_signal
-        self.cmd_vel_pub.publish(cmd_vel)
-        
-        self.prev_distance = distance
-        self.last_time = current_time
+        self.last_range = current_range
+        self.previous_time = now
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
-        controller = PIDController()
+        DistanceMaintainer()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
