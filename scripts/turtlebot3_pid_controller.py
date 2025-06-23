@@ -12,8 +12,8 @@ class DistanceMaintainer:
 
         # Параметры регулятора
         self.desired_range = 1.2
-        self.gain_p = 0.8
-        self.gain_i = 0.0
+        self.gain_p = 1
+        self.gain_i = 0.05
         self.gain_d = 0.2
         self.velocity_limit = 0.6
         self.view_angle_deg = 5.0
